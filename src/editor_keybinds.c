@@ -93,7 +93,7 @@ static const char default_keybinds[] =
     "ctrl+shift+s  save_as\n"
     "ctrl+comma    open_keybinds\n"
     "ctrl+p        file_picker\n";
-
+r
 static const struct { const char *name; Key key; } named_keys[] = {
     { "left", KEY_LEFT }, { "right", KEY_RIGHT }, { "up", KEY_UP }, { "down", KEY_DOWN },
     { "home", KEY_HOME }, { "end", KEY_END }, { "pageup", KEY_PAGE_UP }, { "pagedown", KEY_PAGE_DOWN },
