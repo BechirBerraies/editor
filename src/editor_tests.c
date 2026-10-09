@@ -1,5 +1,5 @@
 // editor_tests.c - self-test of the editor core: gap buffer, undo grouping, lines and columns,
-// load normalization, selection and clipboard, keybinds parsing and fuzzy matching.
+// load normalization, selection and clipboard, bracket pairing, keybinds parsing and fuzzy matching.
 // Part of the unity build: included after editor.c. Run with `editor.exe --selftest`;
 // debug builds also run it at startup.
 
@@ -297,6 +297,115 @@ static void test_selection(EditorState *s)
     *s->platform = saved;
 }
 
+// Types like the keyboard does: pairing on, '\n' is the Enter command.
+static void type_keys(EditorState *s, const char *text)
+{
+    for (; *text; text++) {
+        if (*text == '\n') newline(s);
+        else type_char(s, (u8)*text);
+    }
+}
+
+static void test_auto_pair(EditorState *s)
+{
+    // Openers insert their closer before blanks, closers and the end, nowhere else.
+    doc_reset(s);
+    type_keys(s, "([{");
+    CHECK(text_is(s, "([{}])") && s->cursor == 3);
+    doc_reset(s);
+    type_text(s, "foo");
+    move_cursor(s, 0);
+    type_keys(s, "(");
+    CHECK(text_is(s, "(foo") && s->cursor == 1);
+
+    // A closer steps over the same one; otherwise it is typed. Undo goes a bracket at a time.
+    doc_reset(s);
+    type_keys(s, "f(x)");
+    CHECK(text_is(s, "f(x)") && s->cursor == 4);
+    type_keys(s, ")");
+    CHECK(text_is(s, "f(x))") && s->cursor == 5);
+    doc_reset(s);
+    type_keys(s, "foo(bar)");
+    undo(s);
+    CHECK(text_is(s, "foo()") && s->cursor == 4);
+    undo(s);
+    CHECK(text_is(s, ""));
+
+    // Quotes pair too, but not after a word character or a backslash, and step over themselves.
+    doc_reset(s);
+    type_keys(s, "\"a\"");
+    CHECK(text_is(s, "\"a\"") && s->cursor == 3);
+    doc_reset(s);
+    type_keys(s, "it's");
+    CHECK(text_is(s, "it's"));
+    doc_reset(s);
+    type_text(s, "\\");
+    type_keys(s, "'");
+    CHECK(text_is(s, "\\'"));
+
+    // Backspace in an empty pair deletes both halves, as one undo step.
+    doc_reset(s);
+    type_keys(s, "x(");
+    backspace(s);
+    CHECK(text_is(s, "x") && s->cursor == 1);
+    undo(s);
+    CHECK(text_is(s, "x()") && s->cursor == 2);
+    doc_reset(s);
+    type_keys(s, "(a");
+    backspace(s);
+    CHECK(text_is(s, "()"));
+
+    // An opener wraps the selection and keeps it selected; each wrap is one undo step.
+    doc_reset(s);
+    type_text(s, "foo");
+    select_range(s, 0, 3);
+    type_keys(s, "(");
+    CHECK(text_is(s, "(foo)") && s->anchor == 1 && s->cursor == 4);
+    type_keys(s, "[");
+    CHECK(text_is(s, "([foo])") && s->anchor == 2 && s->cursor == 5);
+    select_range(s, 5, 2);
+    type_keys(s, "'");
+    CHECK(text_is(s, "(['foo'])") && s->anchor == 6 && s->cursor == 3);
+    undo(s);
+    CHECK(text_is(s, "([foo])"));
+    undo(s);
+    undo(s);
+    CHECK(text_is(s, "foo"));
+    redo(s);
+    CHECK(text_is(s, "(foo)"));
+
+    // Enter keeps the indent before the cursor, and opens a block between brackets.
+    doc_reset(s);
+    type_keys(s, "  a\n");
+    CHECK(text_is(s, "  a\n  ") && s->cursor == 6);
+    doc_reset(s);
+    type_text(s, "    a");
+    move_cursor(s, 2);
+    type_keys(s, "\n");
+    CHECK(text_is(s, "  \n    a") && s->cursor == 5);
+    doc_reset(s);
+    type_keys(s, "    f {\n");
+    CHECK(text_is(s, "    f {\n        \n    }") && s->cursor == 16);
+    undo(s);
+    CHECK(text_is(s, "    f {}") && s->cursor == 7);
+    doc_reset(s);
+    type_keys(s, "g(\n");
+    CHECK(text_is(s, "g(\n    \n)") && s->cursor == 7);
+    doc_reset(s);
+    type_keys(s, "\"\n");
+    CHECK(text_is(s, "\"\n\""));
+
+    // The same through the real input path.
+    doc_reset(s);
+    if (!s->font.line_h) font_bake(s);
+    Bitmap no_bitmap = {0};
+    Input paren = {0};
+    paren.kind = INPUT_CHAR;
+    paren.codepoint = '(';
+    editor_update_and_render(g_test_memory, s->platform, &paren, &no_bitmap);
+    CHECK(text_is(s, "()") && s->cursor == 1);
+}
+
 static void test_keybinds(EditorState *s)
 {
     // Defaults parse cleanly, user lines override, bad lines are counted and described.
@@ -345,6 +454,7 @@ b32 editor_self_test(Memory *memory, Platform *platform)
     test_lines(s);
     test_load_normalization(s);
     test_selection(s);
+    test_auto_pair(s);
     test_keybinds(s);
     test_fuzzy_match(s);
 

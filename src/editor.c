@@ -83,6 +83,7 @@ typedef struct Edit {
     u64 len;
     u64 text_offset;   // into the undo_text arena
     u64 cursor_before; // where undo puts the cursor
+    u64 joined;        // undone and redone together with the edit before it
 } Edit;
 
 typedef struct PickerMatch {
@@ -464,6 +465,7 @@ static void undo_push(EditorState *s, u64 kind, u64 pos, const u8 *text, u64 n, 
             e->len = n;
             e->text_offset = offset;
             e->cursor_before = cursor_before;
+            e->joined = 0;
             s->undo_index = s->edit_count;
         }
     }
@@ -481,15 +483,18 @@ static void undo(EditorState *s)
         set_status(s, "Nothing to undo", 0);
         return;
     }
-    Edit *e = &s->edits[s->undo_index - 1];
-    if (e->kind == EDIT_INSERT) {
-        gb_delete(&s->text, e->pos, e->len);
-    } else if (!gb_insert(&s->text, e->pos, s->undo_text.base + e->text_offset, e->len)) {
-        set_status(s, "Out of memory", 0);
-        return;
+    for (;;) {
+        Edit *e = &s->edits[s->undo_index - 1];
+        if (e->kind == EDIT_INSERT) {
+            gb_delete(&s->text, e->pos, e->len);
+        } else if (!gb_insert(&s->text, e->pos, s->undo_text.base + e->text_offset, e->len)) {
+            set_status(s, "Out of memory", 0);
+            return;
+        }
+        s->undo_index--;
+        s->cursor = e->cursor_before;
+        if (!e->joined || s->undo_index == 0) break;
     }
-    s->undo_index--;
-    s->cursor = e->cursor_before;
     s->anchor = s->cursor;
     s->has_desired_col = 0;
     s->undo_break = 1;
@@ -501,18 +506,20 @@ static void redo(EditorState *s)
         set_status(s, "Nothing to redo", 0);
         return;
     }
-    Edit *e = &s->edits[s->undo_index];
-    if (e->kind == EDIT_INSERT) {
-        if (!gb_insert(&s->text, e->pos, s->undo_text.base + e->text_offset, e->len)) {
-            set_status(s, "Out of memory", 0);
-            return;
+    do {
+        Edit *e = &s->edits[s->undo_index];
+        if (e->kind == EDIT_INSERT) {
+            if (!gb_insert(&s->text, e->pos, s->undo_text.base + e->text_offset, e->len)) {
+                set_status(s, "Out of memory", 0);
+                return;
+            }
+            s->cursor = e->pos + e->len;
+        } else {
+            gb_delete(&s->text, e->pos, e->len);
+            s->cursor = e->pos;
         }
-        s->cursor = e->pos + e->len;
-    } else {
-        gb_delete(&s->text, e->pos, e->len);
-        s->cursor = e->pos;
-    }
-    s->undo_index++;
+        s->undo_index++;
+    } while (s->undo_index < s->edit_count && s->edits[s->undo_index].joined);
     s->anchor = s->cursor;
     s->has_desired_col = 0;
     s->undo_break = 1;
@@ -577,9 +584,38 @@ static void edit_insert(EditorState *s, const u8 *text, u64 n)
     if (memchr(text, '\n', n)) s->undo_break = 1; // each line is its own undo step
 }
 
+// The closing half of a bracket or quote pair, or 0.
+static u8 pair_closer(u8 c)
+{
+    switch (c) {
+        case '(': return ')';
+        case '[': return ']';
+        case '{': return '}';
+        case '"': return '"';
+        case '\'': return '\'';
+        default: return 0;
+    }
+}
+
+// The cursor sits between an empty pair: (|) [|] {|} "|" '|'
+static b32 cursor_in_empty_pair(EditorState *s)
+{
+    GapBuffer *b = &s->text;
+    if (has_selection(s) || s->cursor == 0 || s->cursor >= gb_length(b)) return 0;
+    u8 closer = pair_closer(gb_at(b, s->cursor - 1));
+    return closer && gb_at(b, s->cursor) == closer;
+}
+
+// In an empty pair both halves go, as one undo step.
 static void backspace(EditorState *s)
 {
-    if (!delete_selection(s) && s->cursor > 0) edit_delete(s, s->cursor - 1, 1);
+    if (cursor_in_empty_pair(s)) {
+        s->undo_break = 1;
+        edit_delete(s, s->cursor - 1, 2);
+        s->undo_break = 1;
+    } else if (!delete_selection(s) && s->cursor > 0) {
+        edit_delete(s, s->cursor - 1, 1);
+    }
 }
 
 static void delete_forward(EditorState *s)
@@ -700,6 +736,102 @@ static void paste(EditorState *s)
     s->undo_break = 1;
     edit_insert(s, text, n);
     s->undo_break = 1;
+}
+
+static b32 is_word_char(u8 c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+// Wraps the selection in open/close and keeps the wrapped text selected. One undo step.
+static void wrap_selection(EditorState *s, u8 open, u8 close)
+{
+    u64 start, end;
+    selection_range(s, &start, &end);
+    b32 forward = s->cursor == end;
+    s->undo_break = 1;
+    if (!gb_insert(&s->text, end, &close, 1)) {
+        set_status(s, "Out of memory", 0);
+        return;
+    }
+    undo_push(s, EDIT_INSERT, end, &close, 1, s->cursor);
+    if (!gb_insert(&s->text, start, &open, 1)) {
+        set_status(s, "Out of memory", 0);
+        return;
+    }
+    undo_push(s, EDIT_INSERT, start, &open, 1, s->cursor);
+    if (s->undo_index >= 2) s->edits[s->undo_index - 1].joined = 1;
+    s->undo_break = 1;
+    s->anchor = forward ? start + 1 : end + 1;
+    s->cursor = forward ? end + 1 : start + 1;
+    s->has_desired_col = 0;
+}
+
+// A typed character, with bracket and quote pairing: an opener wraps the selection, or inserts
+// its closer too when the next character is blank, a closing bracket or the end; quotes also need
+// a previous character that isn't part of a word or a backslash. Typing the closer that is
+// already next just steps over it.
+static void type_char(EditorState *s, u8 c)
+{
+    GapBuffer *b = &s->text;
+    u8 closer = pair_closer(c);
+    if (closer && has_selection(s)) {
+        wrap_selection(s, c, closer);
+        return;
+    }
+    u64 len = gb_length(b);
+    u8 next = !has_selection(s) && s->cursor < len ? gb_at(b, s->cursor) : 0;
+    u8 prev = !has_selection(s) && s->cursor > 0 ? gb_at(b, s->cursor - 1) : 0;
+    b32 is_quote = c == '"' || c == '\'';
+    if (next == c && (is_quote || c == ')' || c == ']' || c == '}')) {
+        move_cursor(s, s->cursor + 1);
+        return;
+    }
+    b32 pair = closer && (s->cursor == len || next == ' ' || next == '\t' || next == '\r' || next == '\n' ||
+                          next == ')' || next == ']' || next == '}');
+    if (pair && is_quote && (is_word_char(prev) || prev == '\\')) pair = 0;
+    if (pair) {
+        u8 text[2] = { c, closer };
+        edit_insert(s, text, 2);
+        s->cursor--;
+        s->anchor = s->cursor;
+    } else {
+        edit_insert(s, &c, 1);
+    }
+}
+
+// Enter keeps the indent before the cursor; between brackets it opens an indented block:
+// "{|}" becomes "{\n<indent>    |\n<indent>}".
+static void newline(EditorState *s)
+{
+    GapBuffer *b = &s->text;
+    delete_selection(s);
+    u64 start = line_start(b, s->cursor);
+    u64 indent_end = start;
+    while (indent_end < s->cursor && (gb_at(b, indent_end) == ' ' || gb_at(b, indent_end) == '\t')) indent_end++;
+    u64 indent = indent_end - start;
+    u8 prev = s->cursor > 0 ? gb_at(b, s->cursor - 1) : 0;
+    u8 next = s->cursor < gb_length(b) ? gb_at(b, s->cursor) : 0;
+    b32 block = (prev == '(' || prev == '[' || prev == '{') && next == pair_closer(prev);
+
+    u64 n = 1 + indent + (block ? 4 + 1 + indent : 0);
+    u8 *text = arena_push(&s->transient, n);
+    if (!text) {
+        set_status(s, "Out of memory", 0);
+        return;
+    }
+    text[0] = '\n';
+    gb_copy(b, start, indent, text + 1);
+    if (block) {
+        memcpy(text + 1 + indent, "    \n", 5);
+        gb_copy(b, start, indent, text + 1 + indent + 5);
+    }
+    u64 pos = s->cursor;
+    edit_insert(s, text, n);
+    if (block) {
+        s->cursor = pos + 1 + indent + 4;
+        s->anchor = s->cursor;
+    }
 }
 
 //
@@ -1409,7 +1541,7 @@ static void run_command(EditorState *s, Command command, b32 extend)
             break;
         case CMD_BACKSPACE:  backspace(s); break;
         case CMD_DELETE:     delete_forward(s); break;
-        case CMD_NEWLINE:    edit_insert(s, (const u8 *)"\n", 1); break;
+        case CMD_NEWLINE:    newline(s); break;
         case CMD_INSERT_TAB: edit_insert(s, (const u8 *)"    ", 4); break;
         case CMD_SELECT_ALL:       select_range(s, 0, len); break;
         case CMD_SELECT_LINE:      select_line(s); break;
@@ -1523,8 +1655,7 @@ Output editor_update_and_render(Memory *memory, Platform *platform, Input *input
             if (s->picker_open) {
                 picker_type(s, input->codepoint);
             } else if (input->codepoint >= 32 && input->codepoint <= 126) {
-                u8 c = (u8)input->codepoint;
-                edit_insert(s, &c, 1);
+                type_char(s, (u8)input->codepoint);
             }
             follow_cursor = 1;
             break;
