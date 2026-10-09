@@ -1,0 +1,35 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug editor",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/editor.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "build debug",
+            "console": "internalConsole"
+        },
+        {
+            "name": "Debug editor (open this folder)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/editor.exe",
+            "args": ["."],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "build debug",
+            "console": "internalConsole"
+        },
+        {
+            "name": "Debug self-test",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/editor.exe",
+            "args": ["--selftest"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "build debug",
+            "console": "internalConsole"
+        }
+    ]
+}

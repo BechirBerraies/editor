@@ -1,0 +1,21 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build debug",
+            "type": "shell",
+            "command": "${workspaceFolder}/build.bat",
+            "options": { "shell": { "executable": "cmd.exe", "args": ["/c"] } },
+            "problemMatcher": ["$msCompile"],
+            "group": { "kind": "build", "isDefault": true }
+        },
+        {
+            "label": "build release",
+            "type": "shell",
+            "command": "${workspaceFolder}/build.bat",
+            "args": ["release"],
+            "options": { "shell": { "executable": "cmd.exe", "args": ["/c"] } },
+            "problemMatcher": ["$msCompile"]
+        }
+    ]
+}
